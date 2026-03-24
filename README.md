@@ -69,7 +69,7 @@ Perform the following steps on your GitHub repository (remote repository) after 
 |-------------|-------------------------------|
 | USERNAME    | <USERNAME_OF_SIEM_HOST>       |
 | HOST        | <PUBLIC_IP_OF_SIEM_HOST>      |
-| SSH_KEY     | <PUBLIC_KEY_OF_SIEM_HOST>     |
+| SSH_KEY     | <PRIVATE_KEY_OF_SIEM_HOST>     |
 | PORT        | <SSH_PORT_OF_SIEM_HOST>       |
 3. Ensure that a `dev` branch is created if it does not not already exist.
 4. Create a pull request to merge the changes on the `main` branch to the `dev` branch. This will update the `dev` branch with the recent changes from the local Git repository and the `automation.yml` file.

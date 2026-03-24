@@ -1,30 +1,31 @@
-name: Update Rulesets on SIEM
+name: Deploy Rulesets to Wazuh Cloud
+
 on:
   push:
-    branches: [ "main" ]
-    paths: ["**.xml"]
+    branches: ["main"]
+    paths: ["rules/**.xml", "decoders/**.xml"]
   workflow_dispatch:
 
 jobs:
-
-  DaaC:
+  deploy:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Apply modified or new decoders and rules to SIEM
-        uses: appleboy/ssh-action@v1.0.0
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
         with:
-          host: ${{ secrets.HOST }}
-          username: ${{ secrets.USERNAME }}
-          key: ${{ secrets.SSH_KEY }}
-          port: ${{ secrets.PORT }}
-          script: |
-            sudo bash -c '
-            cd /var/ossec/etc/
-            git pull origin main
-            chown wazuh:wazuh /var/ossec/etc/decoders/* && chmod 660 /var/ossec/etc/decoders/*
-            chown wazuh:wazuh /var/ossec/etc/rules/* && chmod 660 /var/ossec/etc/rules/*
-            sudo systemctl restart wazuh-manager \
-            && echo "Ruleset apply SUCCESS!!! - Wazuh manager restarted successfully." \
-            || echo "Ruleset apply FAILURE!!! - Wazuh manager failed to restart, check ruleset for error..."
-            sudo systemctl status wazuh-manager -l --no-pager
-            '
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Deploy rules and decoders to Wazuh Cloud
+        env:
+          WAZUH_API_URL: ${{ secrets.WAZUH_API_URL }}
+          WAZUH_API_USER: ${{ secrets.WAZUH_API_USER }}
+          WAZUH_API_PASSWORD: ${{ secrets.WAZUH_API_PASSWORD }}
+        run: |
+          python deploy_to_wazuh.py
