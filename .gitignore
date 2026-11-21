@@ -1,17 +1,29 @@
+# This repository is cloned into /var/ossec/etc on the Wazuh manager, next to
+# secrets such as client.keys, authd.pass and sslmanager.key. It is therefore an
+# ALLOW-LIST: everything is ignored unless it is listed below, so `git add .` on
+# the SIEM can never stage a secret or a config file by accident.
 
-# Ignore the following files
+/*
+!/.gitignore
+!/.github/
+!/README.md
+!/check_rule_ids.py
+!/branch_rules/
+!/deploy/
 
-client.keys
-internal_options.conf
-local_internal_options.conf
-ossec.conf
-sslmanager.cert
-localtime
-sslmanager.key
+# Rulesets: only top-level XML files.
+!/rules/
+/rules/*
+!/rules/*.xml
+!/decoders/
+/decoders/*
+!/decoders/*.xml
 
-# Ignore the following directories
-
-lists/
-rootcheck/
-shared/
-
+# Never track key material or editor leftovers, even inside allowed folders.
+*.key
+*.pem
+*.pass
+*.swp
+*~
+*.bak
+*.orig
