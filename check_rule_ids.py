@@ -1,131 +1,177 @@
+#!/usr/bin/env python3
+"""Validate the Wazuh ruleset in this repository. Fails closed.
+
+The checks run against the whole checked-out tree rather than a diff. In a
+``pull_request`` run that tree is the merge of the PR into ``main``, i.e. exactly
+what will be deployed, so renamed, moved, and newly added files are all handled
+the same way and duplicates across several files in one PR are caught.
+
+Errors (exit code 1):
+  * a symlink anywhere in the repository (the deploy job runs chown/chmod as root)
+  * a file under rules/ or decoders/ that is not a top-level *.xml file
+  * a rules/ or decoders/ file that cannot be read or parsed
+  * a <rule> without a purely numeric id
+  * the same rule id defined more than once
+  * a rule id outside the custom range that does not set overwrite="yes"
+
+Warnings (shown for reviewers, do not fail the check):
+  * overwrite="yes" rules, which replace an existing (usually built-in) rule
+  * level="0" rules, which silence every event they match
+"""
+
+import os
+import re
 import subprocess
-import xml.etree.ElementTree as ET
-from pathlib import Path
 import sys
-from collections import defaultdict, Counter
+import xml.parsers.expat
+from collections import defaultdict
+from pathlib import Path
 
-def run_git_command(args):
-    result = subprocess.run(args, capture_output=True, text=True, check=True)
-    return result.stdout
+# Wazuh reserves ids below 100000 for its built-in ruleset; local rules belong
+# in 100000-120000 (https://documentation.wazuh.com/current/user-manual/ruleset/).
+CUSTOM_ID_MIN = 100000
+CUSTOM_ID_MAX = 120000
 
-def get_changed_rule_files():
-    try:
-        output = run_git_command(["git", "diff", "--name-status", "origin/main...HEAD"])
-        changed_files = []
-        for line in output.strip().splitlines():
-            parts = line.strip().split(maxsplit=1)
-            if len(parts) != 2:
-                continue
-            status, file_path = parts
-            if file_path.startswith("rules/") and file_path.endswith(".xml"):
-                changed_files.append((status, Path(file_path)))
-        return changed_files
-    except subprocess.CalledProcessError as e:
-        print("❌ Failed to get changed files:", e)
-        sys.exit(1)
+RULESET_DIRS = ("rules", "decoders")
+SYMLINK_MODE = "120000"
 
-def extract_rule_ids_from_xml(content):
-    ids = []
-    try:
-        # Wrap multiple root elements in a fake <root> tag to avoid parse errors
-        wrapped = f"<root>{content}</root>"
-        root = ET.fromstring(wrapped)
-        for rule in root.findall(".//rule"):
-            rule_id = rule.get("id")
-            if rule_id and rule_id.isdigit():
-                ids.append(int(rule_id))
-    except ET.ParseError as e:
-        print(f"⚠️ XML Parse Error: {e}")
-    return ids
+IN_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
+
+# Wazuh's own XML reader is more lenient than a standards-compliant parser. These
+# two rewrites accept what Wazuh accepts while keeping line numbers unchanged.
+XML_DECLARATION = re.compile(r"\A\s*<\?xml[^>]*\?>")
+BARE_AMPERSAND = re.compile(r"&(?!(?:[A-Za-z][A-Za-z0-9]*|#[0-9]+|#x[0-9A-Fa-f]+);)")
 
 
-def get_rule_ids_per_file_in_main():
-    run_git_command(["git", "fetch", "origin", "main"])
-    files_output = run_git_command(["git", "ls-tree", "-r", "origin/main", "--name-only"])
-    xml_files = [f for f in files_output.splitlines() if f.startswith("rules/") and f.endswith(".xml")]
+class Report:
+    def __init__(self):
+        self.errors = 0
+        self.warnings = 0
 
-    rule_id_to_files = defaultdict(set)
-    for file in xml_files:
-        try:
-            content = run_git_command(["git", "show", f"origin/main:{file}"])
-            rule_ids = extract_rule_ids_from_xml(content)
-            for rule_id in rule_ids:
-                rule_id_to_files[rule_id].add(file)
-        except subprocess.CalledProcessError:
+    def _emit(self, kind, message, path=None, line=None):
+        where = f"{path}:{line}" if path and line else (str(path) if path else "")
+        icon = "❌" if kind == "error" else "⚠️"
+        print(f"{icon} {where + ': ' if where else ''}{message}")
+        if IN_ACTIONS:
+            location = ""
+            if path:
+                location = f" file={path}" + (f",line={line}" if line else "")
+            print(f"::{kind}{location}::{message}")
+
+    def error(self, message, path=None, line=None):
+        self.errors += 1
+        self._emit("error", message, path, line)
+
+    def warning(self, message, path=None, line=None):
+        self.warnings += 1
+        self._emit("warning", message, path, line)
+
+
+def git(*args):
+    return subprocess.run(["git", *args], capture_output=True, text=True, check=True).stdout
+
+
+def tracked_files():
+    """Yield (mode, path) for every tracked file, NUL-separated so no path is quoted."""
+    for entry in git("ls-files", "--stage", "-z").split("\0"):
+        if not entry:
             continue
-    return rule_id_to_files
+        meta, path = entry.split("\t", 1)
+        yield meta.split()[0], path
 
-def get_rule_ids_from_main_version(file_path: Path):
-    try:
-        content = run_git_command(["git", "show", f"origin/main:{file_path.as_posix()}"])
-        return extract_rule_ids_from_xml(content)
-    except subprocess.CalledProcessError:
-        return []
 
-def detect_duplicates(rule_ids):
-    counter = Counter(rule_ids)
-    return [rule_id for rule_id, count in counter.items() if count > 1]
+def parse_rules(path, text):
+    """Return [(raw_id, attrs, line)] for every <rule>, or raise ExpatError."""
+    text = XML_DECLARATION.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
+    text = BARE_AMPERSAND.sub("&amp;", text)
 
-def print_conflicts(conflicting_ids, rule_id_to_files):
-    print("❌ Conflicts detected:")
-    for rule_id in sorted(conflicting_ids):
-        files = rule_id_to_files.get(rule_id, [])
-        print(f"  - Rule ID {rule_id} found in:")
-        for f in files:
-            print(f"    • {f}")
+    rules = []
+    parser = xml.parsers.expat.ParserCreate()
+
+    def start(name, attrs):
+        if name == "rule":
+            rules.append((attrs.get("id"), attrs, parser.CurrentLineNumber))
+
+    parser.StartElementHandler = start
+    # Rule files have several top-level elements (<group>, <var>), so wrap them.
+    # The opening tag adds no newline, so reported line numbers match the file.
+    parser.Parse(f"<root>{text}</root>", True)
+    return rules
+
 
 def main():
-    changed_files = get_changed_rule_files()
-    if not changed_files:
-        print("✅ No rule files were changed in this PR.")
-        return
+    os.chdir(git("rev-parse", "--show-toplevel").strip())
+    report = Report()
 
-    rule_id_to_files_main = get_rule_ids_per_file_in_main()
+    ruleset_files = []
+    for mode, path in tracked_files():
+        if mode == SYMLINK_MODE:
+            report.error("symlinks are not allowed in this repository", path)
+            continue
+        parts = Path(path).parts
+        if parts[0] in RULESET_DIRS:
+            if len(parts) != 2 or not path.endswith(".xml"):
+                report.error(
+                    f"only top-level *.xml files are deployed from {parts[0]}/", path
+                )
+                continue
+            ruleset_files.append(Path(path))
 
-    print(f"🔍 Checking rule ID conflicts for files: {[f.name for _, f in changed_files]}")
+    id_locations = defaultdict(list)
+    rule_count = 0
 
-    for status, path in changed_files:
-        print(f"\n🔎 Checking file: {path.name}")
-
+    for path in sorted(ruleset_files):
         try:
-            dev_content = path.read_text()
-            dev_ids = extract_rule_ids_from_xml(dev_content)
-        except Exception as e:
-            print(f"⚠️ Could not read {path.name}: {e}")
+            text = path.read_bytes().decode("utf-8")
+            rules = parse_rules(path, text)
+        except (OSError, UnicodeDecodeError) as e:
+            report.error(f"could not read file: {e}", path)
+            continue
+        except xml.parsers.expat.ExpatError as e:
+            report.error(f"XML parse error: {xml.parsers.expat.errors.messages[e.code]}",
+                         path, e.lineno)
             continue
 
-        # Check for internal duplicates
-        duplicates = detect_duplicates(dev_ids)
-        if duplicates:
-            print(f"❌ Duplicate rule IDs detected in {path.name}: {sorted(duplicates)}")
-            sys.exit(1)
+        if path.parts[0] != "rules":
+            continue  # decoders only need to be well-formed
 
-        if status == "A":
-            # New file
-            conflicting_ids = set(dev_ids) & set(rule_id_to_files_main.keys())
-            if conflicting_ids:
-                print_conflicts(conflicting_ids, rule_id_to_files_main)
-                sys.exit(1)
-            else:
-                print(f"✅ No conflict in new file {path.name}")
-
-        elif status == "M":
-            # Modified file
-            main_ids = get_rule_ids_from_main_version(path)
-            if set(dev_ids) == set(main_ids):
-                print(f"ℹ️ {path.name} modified but rule IDs unchanged.")
+        for raw_id, attrs, line in rules:
+            rule_count += 1
+            rule_id = (raw_id or "").strip()
+            if not re.fullmatch(r"[0-9]+", rule_id):
+                report.error(f"rule has a missing or non-numeric id: {raw_id!r}", path, line)
                 continue
+            rule_id = int(rule_id)
+            id_locations[rule_id].append((path, line))
 
-            new_or_changed_ids = set(dev_ids) - set(main_ids)
-            conflicting_ids = new_or_changed_ids & set(rule_id_to_files_main.keys())
+            overwrite = attrs.get("overwrite", "").strip().lower() == "yes"
+            in_range = CUSTOM_ID_MIN <= rule_id <= CUSTOM_ID_MAX
+            if overwrite:
+                report.warning(f"rule {rule_id} uses overwrite=\"yes\" and replaces an "
+                               "existing rule; review it carefully", path, line)
+            elif not in_range:
+                report.error(f"rule id {rule_id} is outside the custom range "
+                             f"{CUSTOM_ID_MIN}-{CUSTOM_ID_MAX}; pick a custom id, or set "
+                             "overwrite=\"yes\" if replacing a built-in rule is intended",
+                             path, line)
+            if attrs.get("level", "").strip() == "0":
+                report.warning(f"rule {rule_id} has level=\"0\" and will silence every "
+                               "event it matches; review it carefully", path, line)
 
-            if conflicting_ids:
-                print_conflicts(conflicting_ids, rule_id_to_files_main)
-                sys.exit(1)
-            else:
-                print(f"✅ Modified file {path.name} has no conflicting rule IDs.")
+    for rule_id, locations in sorted(id_locations.items()):
+        if len(locations) > 1:
+            where = ", ".join(f"{p}:{line}" for p, line in locations)
+            for path, line in locations:
+                report.error(f"rule id {rule_id} is defined {len(locations)} times ({where})",
+                             path, line)
 
-    print("\n✅ All rule file changes passed conflict checks.")
+    print(f"\n🔍 Checked {len(ruleset_files)} ruleset file(s), {rule_count} rule(s): "
+          f"{report.errors} error(s), {report.warnings} warning(s).")
+    if report.errors:
+        print("❌ Ruleset check failed.")
+        sys.exit(1)
+    print("✅ Ruleset check passed.")
+
 
 if __name__ == "__main__":
     main()
