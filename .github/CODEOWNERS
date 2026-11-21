@@ -1,0 +1,15 @@
+# Every change to this repository is deployed to the SIEM, so every change needs
+# a code owner's review. Paired with "require_code_owner_review" in
+# branch_rules/protect_main.json.
+#
+# Add the security engineers who review detections here, e.g. a team:
+#   *  @your-org/detection-engineering
+
+*                      @SamsonIdowu
+
+# The CI checks, the deploy script and the branch rules control what reaches the
+# SIEM. Keep their owners to people trusted with root on it.
+/.github/              @SamsonIdowu
+/check_rule_ids.py     @SamsonIdowu
+/deploy/               @SamsonIdowu
+/branch_rules/         @SamsonIdowu

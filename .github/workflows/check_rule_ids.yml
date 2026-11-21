@@ -3,25 +3,27 @@ name: Check Rule ID Conflicts
 on:
   pull_request:
     branches: [ "main" ]
-    # paths: ["**.xml"]
+    # No path filter on purpose: "check-rule-ids" is a required status check,
+    # and a filtered-out workflow never reports, which would block the PR.
+
+permissions:
+  contents: read
 
 jobs:
   check-rule-ids:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout PR branch
-        uses: actions/checkout@v3
+      # Checks out the merge of the PR into main, i.e. exactly what would deploy.
+      - name: Checkout PR merge commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0  # Required for git diff and history
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: '3.10'
+          python-version: '3.12'
 
-      - name: Fetch main branch
-        run: git fetch origin main
-
-      - name: Run rule ID conflict checker
+      - name: Validate ruleset (rule IDs, XML, symlinks)
         run: python check_rule_ids.py
